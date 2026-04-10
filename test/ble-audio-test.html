@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POTACAT Speakermic Test</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, sans-serif; background: #111; color: #eee; padding: 16px; max-width: 480px; margin: 0 auto; }
+h1 { font-size: 18px; margin-bottom: 12px; color: #8cf; }
+.card { background: #1a1a2e; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+.label { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 4px; }
+.value { font-size: 16px; font-weight: bold; }
+button { width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-bottom: 8px; }
+.btn-connect { background: #2563eb; color: white; }
+.btn-connect:disabled { background: #333; color: #666; }
+.btn-disconnect { background: #dc2626; color: white; }
+.status { display: flex; gap: 12px; align-items: center; }
+.dot { width: 12px; height: 12px; border-radius: 50%; }
+.dot-off { background: #444; }
+.dot-on { background: #4ade80; }
+.dot-tx { background: #f87171; animation: pulse 0.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+#vu { width: 100%; height: 24px; background: #222; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+#vu-bar { height: 100%; background: linear-gradient(90deg, #4ade80, #facc15, #f87171); width: 0%; transition: width 50ms; }
+#log { background: #0a0a1a; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; color: #8cf; height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+
+<h1>POTACAT Speakermic Test</h1>
+
+<div class="card">
+  <div class="status">
+    <div class="dot" id="dot"></div>
+    <div>
+      <div class="label">Connection</div>
+      <div class="value" id="conn-status">Disconnected</div>
+    </div>
+    <div style="margin-left:auto; text-align:right;">
+      <div class="label">PTT</div>
+      <div class="value" id="ptt-status">--</div>
+    </div>
+  </div>
+</div>
+
+<button class="btn-connect" id="btn-connect" onclick="doConnect()">Connect to POTACAT-MIC</button>
+<button class="btn-disconnect" id="btn-disconnect" onclick="doDisconnect()" style="display:none">Disconnect</button>
+
+<div class="card">
+  <div class="label">Mic Audio Level (from ESP32)</div>
+  <div id="vu"><div id="vu-bar"></div></div>
+  <div style="margin-top:6px; font-size:12px; color:#888;">
+    Frames: <span id="frame-count">0</span> &nbsp;|&nbsp; Avg: <span id="avg-level">0</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="label">Log</div>
+  <div id="log"></div>
+</div>
+
+<script>
+// ============================================================
+// IMA-ADPCM Decoder
+// ============================================================
+const STEP=[7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767];
+const IDX=[-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8];
+
+function adpcmDecode(input) {
+    if (input.length < 4) return new Float32Array(0);
+    let pred = (input[0] | (input[1] << 8)) << 16 >> 16;
+    let idx = Math.min(88, Math.max(0, input[2]));
+    const dataLen = input.length - 4;
+    const pcm = new Float32Array(dataLen * 2);
+    let sc = 0;
+    for (let bi = 0; bi < dataLen; bi++) {
+        for (let ni = 0; ni < 2; ni++) {
+            const nib = ni === 0 ? (input[4+bi] & 0x0F) : ((input[4+bi]>>4) & 0x0F);
+            const step = STEP[idx];
+            let delta = (step >> 3);
+            if (nib & 4) delta += step;
+            if (nib & 2) delta += (step >> 1);
+            if (nib & 1) delta += (step >> 2);
+            if (nib & 8) delta = -delta;
+            pred = Math.max(-32768, Math.min(32767, pred + delta));
+            idx = Math.min(88, Math.max(0, idx + IDX[nib]));
+            pcm[sc++] = pred / 32768.0;
+        }
+    }
+    return pcm.subarray(0, sc);
+}
+
+// ============================================================
+// BLE + Audio
+// ============================================================
+const SVC    = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+const TX_AUD = 'f47ac10b-58cc-4372-a567-0e02b2c30001';
+const RX_AUD = 'f47ac10b-58cc-4372-a567-0e02b2c30002';
+const CTL    = 'f47ac10b-58cc-4372-a567-0e02b2c30003';
+const DEV    = 'f47ac10b-58cc-4372-a567-0e02b2c30004';
+
+let device, server, txChar, rxChar, ctlChar, devChar;
+let audioCtx, frameCount = 0, connected = false;
+
+// Audio playback queue
+let playQueue = [];
+let playing = false;
+let nextPlayTime = 0;
+
+const logEl = document.getElementById('log');
+const dot = document.getElementById('dot');
+const connSt = document.getElementById('conn-status');
+const pttSt = document.getElementById('ptt-status');
+const vuBar = document.getElementById('vu-bar');
+const frameCt = document.getElementById('frame-count');
+const avgLvl = document.getElementById('avg-level');
+
+function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent += `[${t}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(msg);
+}
+
+async function doConnect() {
+    if (!navigator.bluetooth) {
+        log('ERROR: Web Bluetooth not available. Use Chrome or Bluefy.');
+        return;
+    }
+    try {
+        document.getElementById('btn-connect').disabled = true;
+        log('Scanning for POTACAT-MIC...');
+
+        device = await navigator.bluetooth.requestDevice({
+            filters: [{ services: [SVC] }]
+        });
+        device.addEventListener('gattserverdisconnected', onDisconnect);
+
+        log('Connecting to GATT...');
+        server = await device.gatt.connect();
+        const svc = await server.getPrimaryService(SVC);
+
+        txChar = await svc.getCharacteristic(TX_AUD);
+        rxChar = await svc.getCharacteristic(RX_AUD);
+        ctlChar = await svc.getCharacteristic(CTL);
+        devChar = await svc.getCharacteristic(DEV);
+
+        // Subscribe to TX audio (mic data from ESP32)
+        await txChar.startNotifications();
+        txChar.addEventListener('characteristicvaluechanged', onTxAudio);
+
+        // Subscribe to control (PTT state, etc)
+        await ctlChar.startNotifications();
+        ctlChar.addEventListener('characteristicvaluechanged', onControl);
+
+        // Read device info
+        const devVal = await devChar.readValue();
+        log(`Device: battery=${devVal.getUint8(0)}% fw=v${devVal.getUint8(1)}.${devVal.getUint8(2)}.${devVal.getUint8(3)}`);
+
+        // Init audio context for playback
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+        await audioCtx.resume();
+
+        connected = true;
+        frameCount = 0;
+        dot.className = 'dot dot-on';
+        connSt.textContent = device.name || 'Connected';
+        pttSt.textContent = 'Idle';
+        document.getElementById('btn-connect').style.display = 'none';
+        document.getElementById('btn-disconnect').style.display = 'block';
+        log('Connected! Short D1 to GND on ESP32 to stream mic audio.');
+
+    } catch (err) {
+        log('Connection failed: ' + err.message);
+        document.getElementById('btn-connect').disabled = false;
+    }
+}
+
+function doDisconnect() {
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    onDisconnect();
+}
+
+function onDisconnect() {
+    connected = false;
+    dot.className = 'dot dot-off';
+    connSt.textContent = 'Disconnected';
+    pttSt.textContent = '--';
+    vuBar.style.width = '0%';
+    document.getElementById('btn-connect').style.display = 'block';
+    document.getElementById('btn-connect').disabled = false;
+    document.getElementById('btn-disconnect').style.display = 'none';
+    log('Disconnected');
+}
+
+function onControl(event) {
+    const d = new Uint8Array(event.target.value.buffer);
+    if (d.length < 2) return;
+    if (d[0] === 0x01) {
+        // PTT
+        const on = d[1] === 1;
+        pttSt.textContent = on ? 'TX' : 'Idle';
+        dot.className = on ? 'dot dot-tx' : 'dot dot-on';
+        if (on) {
+            log('PTT ON — receiving mic audio');
+            nextPlayTime = audioCtx.currentTime + 0.06; // small initial buffer
+        } else {
+            log('PTT OFF');
+        }
+    } else if (d[0] === 0x02) {
+        log('Battery: ' + d[1] + '%');
+    }
+}
+
+function onTxAudio(event) {
+    const data = new Uint8Array(event.target.value.buffer);
+    if (!audioCtx || data.length < 5) return;
+
+    // Decode ADPCM to float32 PCM
+    const pcm = adpcmDecode(data);
+    if (pcm.length === 0) return;
+
+    frameCount++;
+    frameCt.textContent = frameCount;
+
+    // Calculate level for VU meter
+    let sum = 0;
+    for (let i = 0; i < pcm.length; i++) sum += Math.abs(pcm[i]);
+    const avg = sum / pcm.length;
+    avgLvl.textContent = (avg * 32768).toFixed(0);
+    const pct = Math.min(100, avg * 500);
+    vuBar.style.width = pct + '%';
+
+    // Schedule playback
+    const buf = audioCtx.createBuffer(1, pcm.length, 8000);
+    buf.getChannelData(0).set(pcm);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+
+    const frameDuration = pcm.length / 8000;
+    if (nextPlayTime < audioCtx.currentTime) {
+        nextPlayTime = audioCtx.currentTime + 0.005;
+    }
+    src.start(nextPlayTime);
+    nextPlayTime += frameDuration;
+}
+</script>
+</body>
+</html>
